@@ -28,3 +28,18 @@ variable "db_remote_state_key" {
   type        = string
 }
 
+variable "custom_tags" {
+  description = "Custom tags to set on the Instances in the ASG"
+  type        = map(string)
+  default     = {}
+}
+
+variable "enable_autoscaling" {
+  description = "If set to true, enable auto scaling"
+  type        = bool
+}
+
+variable "environment" {
+  description = "The name of the environment we're deploying to"
+  type        = string
+}
