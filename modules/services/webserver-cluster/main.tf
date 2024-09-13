@@ -1,13 +1,14 @@
 resource "aws_instance" "new_host" {
   ami           = "ami-0fb653ca2d3203ac1"
-  instance_type = "t2.micro"
+  instance_type = var.instance_type
   vpc_security_group_ids = [aws_security_group.sg_01.id]
 
   user_data = <<-EOF
-              #!/bin/bash
-              echo "Hello, World" > index.html
-              nohup busybox httpd -f -p ${var.service_port} &
-              EOF
+            #!/bin/bash
+            echo "Hello, World" > index.html
+            nohup busybox httpd -f -p 8080 &
+            EOF
+
 
   user_data_replace_on_change = true
 
@@ -16,6 +17,13 @@ resource "aws_instance" "new_host" {
   }
 }
 
+locals {
+  http_port    = 80
+  any_port     = 0
+  any_protocol = "-1"
+  tcp_protocol = "tcp"
+  all_ips      = ["0.0.0.0/0"]
+}
 variable "service_port" {
  description = "defines to port to run app "
  type        = number
@@ -33,15 +41,18 @@ output "alb_dns_name" {
 }
 
 resource "aws_security_group" "sg_01" {
-  name = "terraform-example-instance"
-
-  ingress {
-    from_port   = var.service_port
-    to_port     = var.service_port
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  name = "${var.cluster_name}-instance"
 }
+resource "aws_security_group_rule" "allow_instance_inbound" {
+type              = "ingress"
+security_group_id = aws_security_group.sg_01.id
+
+from_port   = var.service_port
+to_port     = var.service_port
+protocol    = local.tcp_protocol
+cidr_blocks = local.all_ips
+}
+  
 
 #Create autoscaling group for configuration
 
@@ -50,11 +61,12 @@ resource "aws_launch_configuration" "cluster_host" {
   instance_type = "t2.micro"
   security_groups = [aws_security_group.sg_01.id]
 
-  user_data = <<-EOF
-              #!/bin/bash
-              echo "Hello, World" > index.html
-              nohup busybox httpd -f -p ${var.service_port} &
-              EOF
+  user_data = templatefile("${path.module}/user-data.sh", {
+    server_port = var.service_port
+    db_address  = data.terraform_remote_state.db.outputs.address
+    db_port     = data.terraform_remote_state.db.outputs.port
+  })
+
   # Required when using a launch configuration with an auto scaling group.
 lifecycle {
     create_before_destroy = true
@@ -78,12 +90,12 @@ resource "aws_autoscaling_group" "asg_01" {
   target_group_arns = [aws_lb_target_group.asg.arn]
   health_check_type = "ELB"
 
-  min_size = 2
-  max_size = 10
+  min_size = var.min_size
+  max_size = var.max_size
 
   tag {
     key                 = "Name"
-    value               = "terraform-asg-example"
+    value               = "${var.cluster_name}"
     propagate_at_launch = true
   }
 }
@@ -91,7 +103,7 @@ resource "aws_autoscaling_group" "asg_01" {
 #Create elastic load balancer using terraform
 
 resource "aws_lb" "alb_01" {
-  name               = "terraform-asg-example"
+  name               = "${var.cluster_name}-alb"
   load_balancer_type = "application"
   subnets            = data.aws_subnets.default.ids
   security_groups    = [aws_security_group.alb.id]
@@ -101,7 +113,7 @@ resource "aws_lb" "alb_01" {
 
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.alb_01.arn
-  port              = 80
+  port              = local.http_port
   protocol          = "HTTP"
 
   # By default, return a simple 404 page
@@ -116,24 +128,29 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+
 resource "aws_security_group" "alb" {
-  name = "terraform-example-alb"
+  name = "${var.cluster_name}-alb"
+}
 
-  # Allow inbound HTTP requests
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+resource "aws_security_group_rule" "allow_http_inbound" {
+  type              = "ingress"
+  security_group_id = aws_security_group.alb.id
 
-  # Allow all outbound requests
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  from_port   = local.http_port
+  to_port     = local.http_port
+  protocol    = local.tcp_protocol
+  cidr_blocks = local.all_ips
+}
+
+resource "aws_security_group_rule" "allow_all_outbound" {
+  type              = "egress"
+  security_group_id = aws_security_group.alb.id
+
+  from_port   = local.any_port
+  to_port     = local.any_port
+  protocol    = local.any_protocol
+  cidr_blocks = local.all_ips
 }
 
 resource "aws_lb_target_group" "asg" {
@@ -166,6 +183,14 @@ resource "aws_lb_listener_rule" "asg" {
   action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.asg.arn
+  }
+}
+data "terraform_remote_state" "db" {
+  backend = "s3"
+  config = {
+    bucket = var.db_remote_state_bucket
+    key    = var.db_remote_state_key
+    region = "us-east-2"
   }
 }
 
